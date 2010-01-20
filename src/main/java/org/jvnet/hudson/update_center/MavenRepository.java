@@ -23,6 +23,8 @@
  */
 package org.jvnet.hudson.update_center;
 
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.maven.artifact.Artifact;
@@ -35,6 +37,7 @@ import org.apache.maven.artifact.resolver.AbstractArtifactResolutionException;
 import org.apache.maven.artifact.resolver.ArtifactNotFoundException;
 import org.apache.maven.artifact.resolver.ArtifactResolver;
 import org.apache.maven.artifact.transform.ArtifactTransformationManager;
+import org.apache.tools.ant.taskdefs.Expand;
 import org.codehaus.plexus.ContainerConfiguration;
 import org.codehaus.plexus.DefaultContainerConfiguration;
 import org.codehaus.plexus.DefaultPlexusContainer;
@@ -49,7 +52,10 @@ import org.sonatype.nexus.index.NexusIndexer;
 import org.sonatype.nexus.index.context.UnsupportedExistingLuceneIndexException;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.URL;
+import java.net.URLConnection;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -70,11 +76,19 @@ public class MavenRepository {
     private final List<ArtifactRepository> remoteRepositories;
     private final ArtifactRepository local;
 
-    public MavenRepository() throws PlexusContainerException, ComponentLookupException, IOException, UnsupportedExistingLuceneIndexException {
-        this("java.net2",new File("./index"));
+    public MavenRepository() throws Exception {
+        this("java.net2",new File("./index"), new URL("http://maven.glassfish.org/content/groups/public/"));
     }
 
-    public MavenRepository(String id, File indexDirectory) throws PlexusContainerException, ComponentLookupException, IOException, UnsupportedExistingLuceneIndexException {
+    /**
+     * @param id
+     *      Repository ID. This ID has to match the ID in the repository index, due to a design bug in Maven.
+     * @param indexDirectory
+     *      Directory that contains exploded index zip file.
+     * @param repository
+     *      URL of the Maven repository. Used to resolve artifacts.
+     */
+    public MavenRepository(String id, File indexDirectory, URL repository) throws Exception {
         ClassWorld classWorld = new ClassWorld( "plexus.core", MavenRepository.class.getClassLoader() );
         ContainerConfiguration configuration = new DefaultContainerConfiguration().setClassWorld( classWorld );
         PlexusContainer plexus = new DefaultPlexusContainer( configuration );
@@ -90,12 +104,54 @@ public class MavenRepository {
 
         ArtifactRepositoryPolicy policy = new ArtifactRepositoryPolicy(true, "daily", "warn");
         remoteRepositories = Collections.singletonList(
-                arf.createArtifactRepository("m.g.o-public", "http://maven.glassfish.org/content/groups/public/",
+                arf.createArtifactRepository(id, repository.toExternalForm(),
                         new DefaultRepositoryLayout(), policy, policy));
         local = arf.createArtifactRepository("local",
                 new File(new File(System.getProperty("user.home")), ".m2/repository").toURI().toURL().toExternalForm(),
                 new DefaultRepositoryLayout(), policy, policy);
 
+    }
+
+    /**
+     * Opens a Maven repository by downloading its index file.
+     */
+    public MavenRepository(String id, URL repository) throws Exception {
+        this(id,load(id,new URL(repository,".index/nexus-maven-repository-index.zip")), repository);
+    }
+
+    private static File load(String id, URL url) throws IOException {
+        File dir = new File(new File(System.getProperty("java.io.tmpdir")), "maven-index/" + id);
+        File zip = new File(dir,"index.zip");
+        File expanded = new File(dir,"expanded");
+
+        URLConnection con = url.openConnection();
+        if (!expanded.exists() || !zip.exists() || zip.lastModified()!=con.getLastModified()) {
+            System.out.println("Downloading "+url);
+            // if the download fail in the middle, only leave a broken tmp file
+            dir.mkdirs();
+            File tmp = new File(dir,"index.zi_");
+            FileOutputStream o = new FileOutputStream(tmp);
+            IOUtils.copy(con.getInputStream(), o);
+            o.close();
+
+            if (expanded.exists())
+                FileUtils.deleteDirectory(expanded);
+            expanded.mkdirs();
+
+            Expand e = new Expand();
+            e.setSrc(tmp);
+            e.setDest(expanded);
+            e.execute();
+
+            // as a proof that the expansion was properly completed
+            tmp.renameTo(zip);
+            zip.setLastModified(con.getLastModified());
+        } else {
+            System.out.println("Reusing the locally cached "+url+" at "+zip);
+        }
+
+
+        return expanded;
     }
 
     File resolve(ArtifactInfo a) throws AbstractArtifactResolutionException {
@@ -111,7 +167,7 @@ public class MavenRepository {
     /**
      * Discover all plugins from this Maven repository.
      */
-    public Collection<PluginHistory> listHudsonPlugins() throws PlexusContainerException, ComponentLookupException, IOException, UnsupportedExistingLuceneIndexException, AbstractArtifactResolutionException, ArtifactNotFoundException {
+    public Collection<PluginHistory> listHudsonPlugins() throws PlexusContainerException, ComponentLookupException, IOException, UnsupportedExistingLuceneIndexException, AbstractArtifactResolutionException {
         BooleanQuery q = new BooleanQuery();
         q.add(indexer.constructQuery(ArtifactInfo.PACKAGING,"hpi"), Occur.MUST);
 
@@ -126,7 +182,7 @@ public class MavenRepository {
             PluginHistory p = plugins.get(a.artifactId);
             if (p==null)
                 plugins.put(a.artifactId, p=new PluginHistory(a.artifactId));
-            p.artifacts.put(new VersionNumber(a.version),new HPI(this,p,a));
+            p.artifacts.put(new VersionNumber(a.version), createHpiArtifact(a, p));
             p.groupId.add(a.groupId);
         }
 
@@ -152,9 +208,21 @@ public class MavenRepository {
             if (a.classifier!=null)  continue;          // just pick up the main war
 
             VersionNumber v = new VersionNumber(a.version);
-            r.put(v,new HudsonWar(this,a));
+            r.put(v, createHudsonWarArtifact(a));
         }
 
         return r;
+    }
+
+/*
+    Hook for subtypes to use customized implementations.
+ */
+
+    protected HPI createHpiArtifact(ArtifactInfo a, PluginHistory p) throws AbstractArtifactResolutionException {
+        return new HPI(this,p,a);
+    }
+
+    protected HudsonWar createHudsonWarArtifact(ArtifactInfo a) {
+        return new HudsonWar(this,a);
     }
 }
